@@ -1,0 +1,392 @@
+%% ========================================================================
+% LearnSense AI - VARK Learning Style Classification (Corrected)
+% ========================================================================
+
+clear;
+clc;
+close all;
+
+rng(42);
+
+fprintf('\n============================================\n');
+fprintf('        LearnSense AI - VARK Model\n');
+fprintf('============================================\n');
+
+
+%% ========================================================================
+% 1. IMPORT DATASET
+% ========================================================================
+
+T = readtable('my_csv.csv', ...
+    'VariableNamingRule', 'preserve');
+
+fprintf('Dataset loaded successfully.\n');
+fprintf('Rows    : %d\n', height(T));
+fprintf('Columns : %d\n\n', width(T));
+
+disp('Dataset columns:');
+disp(T.Properties.VariableNames');
+
+
+%% ========================================================================
+% 2. CLEAN DATA
+% ========================================================================
+
+% --- 2a. Remove exact duplicate rows ---
+% ~24% of this dataset is exact duplicate rows, which causes train/test
+% leakage (same row can appear in both splits) and inflates accuracy.
+rowsBefore = height(T);
+T = unique(T, 'rows', 'stable');
+fprintf('Removed %d exact duplicate rows (%d -> %d).\n', ...
+    rowsBefore - height(T), rowsBefore, height(T));
+
+% --- 2b. Drop the accidental duplicate question column ---
+% Columns 19 and 20 have identical header text (a copy-paste typo in the
+% survey export); keep only one so it isn't double-counted as a feature.
+varNames = T.Properties.VariableNames;
+dupCols = find(strcmp(varNames, varNames{end-1}));
+if numel(dupCols) > 1
+    colToDrop = varNames{dupCols(end)};
+    T.(colToDrop) = [];
+    fprintf('Dropped duplicate question column: %s\n', colToDrop);
+end
+
+% --- 2c. Fix implausible Age values ---
+% Survey responses include ages like 10, 11, 12, 32 which are almost
+% certainly data-entry errors for this student population. Keep a
+% reasonable range and drop the rest rather than let them add noise.
+rowsBeforeAge = height(T);
+T = T(T.Age >= 13 & T.Age <= 25, :);
+fprintf('Removed %d rows with implausible Age values (kept 13-25).\n', ...
+    rowsBeforeAge - height(T));
+
+
+%% ========================================================================
+% 3. IDENTIFY COLUMNS
+% ========================================================================
+
+varNames = T.Properties.VariableNames;
+
+genderCol = varNames{1};       % First column = Gender
+targetCol = varNames{end};     % Last column = Learner / Target
+itemCols  = varNames(2:end-1); % Middle columns = Age + Likert questions
+
+fprintf('\nGender column : %s\n', genderCol);
+fprintf('Target column : %s\n', targetCol);
+
+disp('Feature columns:');
+disp(itemCols');
+
+
+%% ========================================================================
+% 4. TARGET VARIABLE
+% ========================================================================
+
+Y = categorical(T.(targetCol));
+
+classes = categories(Y);
+counts = countcats(Y);
+
+disp('Target class distribution:');
+classTable = table(string(classes), counts, 'VariableNames', {'Class','Count'});
+disp(classTable);
+
+
+%% ========================================================================
+% 5. ENCODE GENDER
+% ========================================================================
+
+genderValues = string(T.(genderCol));
+
+disp('Gender values:');
+disp(unique(genderValues));
+
+% Male = 1, Female = 0
+GenderNum = double(strcmpi(genderValues, "Male"));
+
+fprintf('\nGender encoding: Male = 1, Female = 0\n');
+
+
+%% ========================================================================
+% 6. CREATE FEATURE MATRIX
+% ========================================================================
+
+X = T{:, itemCols};
+
+if ~isnumeric(X)
+    error(['Age / Likert columns contain non-numeric values. ', ...
+           'Please convert them to numeric values first.']);
+end
+
+X = [GenderNum, X];
+featureNames = [{'Gender_Male'}, itemCols];
+
+fprintf('\nPredictor matrix:\n');
+fprintf('Rows     : %d\n', size(X,1));
+fprintf('Features : %d\n', size(X,2));
+
+
+%% ========================================================================
+% 7. CHECK MISSING VALUES
+% ========================================================================
+
+missingValues = sum(ismissing(T), 'all');
+fprintf('\nMissing values: %d\n', missingValues);
+
+if missingValues > 0
+    warning('Dataset contains missing values.');
+else
+    fprintf('No missing values found.\n');
+end
+
+
+%% ========================================================================
+% 8. CLASS DISTRIBUTION GRAPH
+% ========================================================================
+
+figure('Name','Class Distribution');
+bar(categorical(classes), counts);
+title('VARK Learning Style Distribution');
+xlabel('Learning Style');
+ylabel('Number of Students');
+
+
+%% ========================================================================
+% 9. TRAIN / TEST SPLIT
+% ========================================================================
+
+cv = cvpartition(Y, 'HoldOut', 0.30, 'Stratify', true);
+
+XTrain = X(training(cv), :);
+YTrain = Y(training(cv));
+
+XTest = X(test(cv), :);
+YTest = Y(test(cv));
+
+fprintf('\n============================================\n');
+fprintf('          TRAIN / TEST SPLIT\n');
+fprintf('============================================\n');
+fprintf('Training samples : %d\n', size(XTrain,1));
+fprintf('Testing samples  : %d\n', size(XTest,1));
+
+
+%% ========================================================================
+% 10. TRAINING CLASS DISTRIBUTION
+% ========================================================================
+
+trainCounts = countcats(YTrain);
+trainTable = table(string(classes), trainCounts, 'VariableNames', {'Class','Count'});
+disp('Training class distribution:');
+disp(trainTable);
+
+
+%% ========================================================================
+% 11. CLASS WEIGHTS / COST MATRIX
+% ========================================================================
+
+maxCount = max(trainCounts);
+classWeight = maxCount ./ trainCounts;
+nClasses = numel(classes);
+
+costMatrix = ones(nClasses) - eye(nClasses);
+for i = 1:nClasses
+    costMatrix(i,:) = costMatrix(i,:) * classWeight(i);
+end
+
+disp('Class weights:');
+weightTable = table(string(classes), classWeight, 'VariableNames', {'Class','Weight'});
+disp(weightTable);
+
+
+%% ========================================================================
+% 12. MODEL 1 - SVM
+% ========================================================================
+
+fprintf('\nTraining SVM...\n');
+
+svmTemplate = templateSVM('KernelFunction', 'linear', 'Standardize', true);
+
+modelSVM = fitcecoc(XTrain, YTrain, ...
+    'Learners', svmTemplate, ...
+    'ClassNames', classes, ...
+    'Cost', costMatrix);
+
+fprintf('SVM training completed.\n');
+
+
+%% ========================================================================
+% 13. MODEL 2 - DECISION TREE
+% ========================================================================
+
+fprintf('\nTraining Decision Tree...\n');
+
+modelTree = fitctree(XTrain, YTrain, ...
+    'ClassNames', classes, ...
+    'Cost', costMatrix, ...
+    'PredictorNames', featureNames);
+
+fprintf('Decision Tree training completed.\n');
+
+
+%% ========================================================================
+% 14. MODEL 3 - NAIVE BAYES
+% ========================================================================
+
+fprintf('\nTraining Naive Bayes...\n');
+
+modelNB = fitcnb(XTrain, YTrain, ...
+    'ClassNames', classes, ...
+    'Cost', costMatrix);
+
+fprintf('Naive Bayes training completed.\n');
+
+
+%% ========================================================================
+% 15. PREDICTION
+% ========================================================================
+
+predSVM  = predict(modelSVM, XTest);
+predTree = predict(modelTree, XTest);
+predNB   = predict(modelNB, XTest);
+
+
+%% ========================================================================
+% 16. EVALUATE MODELS
+% ========================================================================
+
+evaluateModel(YTest, predSVM,  classes, 'SVM (ECOC)');
+evaluateModel(YTest, predTree, classes, 'Decision Tree');
+evaluateModel(YTest, predNB,   classes, 'Naive Bayes');
+
+
+%% ========================================================================
+% 17. CONFUSION MATRICES
+% ========================================================================
+
+YTestChart = categorical(string(YTest));
+
+figure('Name','SVM Confusion Matrix');
+confusionchart(YTestChart, categorical(string(predSVM)), ...
+    'Title','SVM - Confusion Matrix', ...
+    'RowSummary','row-normalized', ...
+    'ColumnSummary','column-normalized');
+
+figure('Name','Decision Tree Confusion Matrix');
+confusionchart(YTestChart, categorical(string(predTree)), ...
+    'Title','Decision Tree - Confusion Matrix', ...
+    'RowSummary','row-normalized', ...
+    'ColumnSummary','column-normalized');
+
+figure('Name','Naive Bayes Confusion Matrix');
+confusionchart(YTestChart, categorical(string(predNB)), ...
+    'Title','Naive Bayes - Confusion Matrix', ...
+    'RowSummary','row-normalized', ...
+    'ColumnSummary','column-normalized');
+
+
+%% ========================================================================
+% 18. FEATURE IMPORTANCE
+% ========================================================================
+
+importance = predictorImportance(modelTree);
+[sortedImportance, index] = sort(importance, 'descend');
+numberToShow = min(10, numel(index));
+
+figure('Name','Feature Importance');
+barh(sortedImportance(1:numberToShow));
+set(gca, ...
+    'YTick', 1:numberToShow, ...
+    'YTickLabel', featureNames(index(1:numberToShow)), ...
+    'YDir','reverse');
+title('Top Features for Learning Style Prediction');
+xlabel('Feature Importance');
+
+fprintf('\n============================================\n');
+fprintf('          TOP PREDICTIVE FEATURES\n');
+fprintf('============================================\n');
+
+numberToPrint = min(5, numel(index));
+for i = 1:numberToPrint
+    fprintf('%d. %s --> %.4f\n', i, featureNames{index(i)}, sortedImportance(i));
+end
+
+
+%% ========================================================================
+% 19. MODEL ACCURACY COMPARISON
+% ========================================================================
+
+accuracySVM  = mean(string(predSVM)  == string(YTest));
+accuracyTree = mean(string(predTree) == string(YTest));
+accuracyNB   = mean(string(predNB)   == string(YTest));
+
+fprintf('\n============================================\n');
+fprintf('             MODEL COMPARISON\n');
+fprintf('============================================\n');
+fprintf('SVM Accuracy           : %.2f%%\n', accuracySVM * 100);
+fprintf('Decision Tree Accuracy : %.2f%%\n', accuracyTree * 100);
+fprintf('Naive Bayes Accuracy   : %.2f%%\n', accuracyNB * 100);
+
+modelNames = categorical({'SVM', 'Decision Tree', 'Naive Bayes'});
+modelAccuracy = [accuracySVM, accuracyTree, accuracyNB] * 100;
+
+figure('Name','Model Accuracy Comparison');
+bar(modelNames, modelAccuracy);
+title('Model Accuracy Comparison');
+xlabel('Machine Learning Model');
+ylabel('Accuracy (%)');
+
+
+%% ========================================================================
+% 20. SAVE BEST MODEL
+% ========================================================================
+
+save('learning_style_svm_model.mat', 'modelSVM', 'featureNames', 'classes');
+
+fprintf('\n============================================\n');
+fprintf('       MODEL SAVED SUCCESSFULLY\n');
+fprintf('============================================\n');
+fprintf('File: learning_style_svm_model.mat\n');
+
+
+%% ========================================================================
+% LOCAL FUNCTION
+% ========================================================================
+
+function evaluateModel(YTrue, YPred, classes, modelName)
+
+    YTrue = string(YTrue);
+    YPred = string(YPred);
+    classes = string(classes);
+
+    accuracy = mean(YTrue == YPred);
+
+    fprintf('\n--------------------------------------------\n');
+    fprintf('%s\n', modelName);
+    fprintf('--------------------------------------------\n');
+    fprintf('Overall Accuracy: %.2f%%\n', accuracy * 100);
+
+    nClasses = numel(classes);
+    precision = zeros(nClasses,1);
+    recall = zeros(nClasses,1);
+    f1 = zeros(nClasses,1);
+
+    for c = 1:nClasses
+        currentClass = classes(c);
+
+        TP = sum(YPred == currentClass & YTrue == currentClass);
+        FP = sum(YPred == currentClass & YTrue ~= currentClass);
+        FN = sum(YPred ~= currentClass & YTrue == currentClass);
+
+        precision(c) = TP / max(TP + FP, 1);
+        recall(c) = TP / max(TP + FN, 1);
+        f1(c) = 2 * precision(c) * recall(c) / max(precision(c) + recall(c), eps);
+    end
+
+    resultsTable = table(classes(:), precision, recall, f1, ...
+        'VariableNames', {'Class','Precision','Recall','F1_Score'});
+    disp(resultsTable);
+
+    macroF1 = mean(f1);
+    fprintf('Macro F1 Score: %.4f\n', macroF1);
+
+end
